@@ -1,0 +1,5 @@
+data/paints.json
+__pycache__/
+*.pyc
+.ipynb_checkpoints/
+.env
