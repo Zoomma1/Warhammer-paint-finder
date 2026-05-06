@@ -1,6 +1,5 @@
 Pillow
 scikit-learn
 numpy
-scipy
 requests
 jupyter

@@ -6,7 +6,6 @@
 
 import json
 import argparse
-from cv2 import kmeans
 import numpy as np
 from pathlib import Path
 from PIL import Image
@@ -14,7 +13,14 @@ from sklearn.cluster import KMeans
 
 DATASET = Path("data/paints.json")
 
-def rgb_to_lab(rgb):
+SAT_THRESHOLD = 0.2
+LUMINOSITY_MAX = 0.85
+COLORED_MIN_RATIO = 10
+KMEANS_N_INIT = 10
+KMEANS_RANDOM_STATE = 42
+
+def rgb_to_lab(rgb: np.ndarray) -> np.ndarray:
+    """Convert RGB array (0-255) to CIE LAB. Accepts any shape (..., 3)."""
     rgb = np.array(rgb, dtype=float) / 255.0
     mask = rgb > 0.04045
     rgb[mask] = ((rgb[mask] + 0.055) / 1.055) ** 2.4
@@ -29,30 +35,41 @@ def rgb_to_lab(rgb):
     b = 200 * (f[..., 1] - f[..., 2])
     return np.stack([L, a, b], axis=-1)
 
-def load_dataset():
+def load_dataset() -> tuple[list[dict], np.ndarray]:
+    """Load paints.json and return (paints list, LAB array)."""
     paints = json.loads(DATASET.read_text(encoding="utf-8"))
     rgb = np.array([[p["r"], p["g"], p["b"]] for p in paints], dtype=float)
     lab = rgb_to_lab(rgb)
     return paints, lab
 
-def extract_colors(image_path, n_colors=5, sat_threshold=0.15):
-    img = Image.open(image_path).convert("RGB")
-    pixels = np.array(img).reshape(-1, 3).astype(float)
-
+def compute_saturation_mask(pixels: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+    """Return per-pixel (saturation, cmax) arrays from a float RGB pixel array."""
     r, g, b = pixels[:, 0]/255, pixels[:, 1]/255, pixels[:, 2]/255
     cmax = np.maximum(np.maximum(r, g), b)
     cmin = np.minimum(np.minimum(r, g), b)
     with np.errstate(invalid='ignore'):
         saturation = np.where(cmax == 0, 0, (cmax - cmin) / cmax)
-    colored = pixels[(saturation > 0.2) & (cmax/255 < 0.85)]
-    source = colored if len(colored) > n_colors * 10 else pixels
+    return saturation, cmax
 
-    kmeans = KMeans(n_clusters=n_colors, n_init=10, random_state=42)
+def extract_colors(
+    image_path: str | Path,
+    n_colors: int = 5,
+    sat_threshold: float = SAT_THRESHOLD,
+) -> tuple[np.ndarray, KMeans, Image.Image]:
+    """Cluster dominant colours in image_path; returns (centers, kmeans, img)."""
+    img = Image.open(image_path).convert("RGB")
+    pixels = np.array(img).reshape(-1, 3).astype(float)
+
+    saturation, cmax = compute_saturation_mask(pixels)
+    colored = pixels[(saturation > sat_threshold) & (cmax/255 < LUMINOSITY_MAX)]
+    source = colored if len(colored) > n_colors * COLORED_MIN_RATIO else pixels
+
+    kmeans = KMeans(n_clusters=n_colors, n_init=KMEANS_N_INIT, random_state=KMEANS_RANDOM_STATE)
     kmeans.fit(source)
     return kmeans.cluster_centers_.astype(int), kmeans, img
 
-
-def save_debug(img, kmeans, colors, path="debug.png"):
+def save_debug(img: Image.Image, kmeans: KMeans, colors: np.ndarray, path: str = "debug.png") -> None:
+    """Save segmented image + colour swatches side-by-side to path."""
     pixels = np.array(img).reshape(-1, 3).astype(float)
     labels = kmeans.predict(pixels)
     segmented = colors[labels].reshape(np.array(img).shape).astype(np.uint8)
@@ -67,7 +84,14 @@ def save_debug(img, kmeans, colors, path="debug.png"):
     Image.fromarray(combined).save(path)
     print(f"Debug sauvegardé → {path}")
 
-def match_colors(dominant_colors, paints, paints_lab, top_n=3, brand=None):
+def match_colors(
+    dominant_colors: np.ndarray,
+    paints: list[dict],
+    paints_lab: np.ndarray,
+    top_n: int = 3,
+    brand: str | None = None,
+) -> list[dict]:
+    """Match each dominant colour against the paint database by ΔE; returns ranked results."""
     results = []
     filtered = [(i, p) for i, p in enumerate(paints)
                 if brand is None or p["brand"].lower() == brand.lower()]
@@ -94,7 +118,8 @@ def match_colors(dominant_colors, paints, paints_lab, top_n=3, brand=None):
 def main():
     parser = argparse.ArgumentParser(description="Warhammer Paint Finder")
     parser.add_argument("image", help="Chemin vers l'image")
-    parser.add_argument("--mode", choices=["figurine", "reference"], default="figurine")
+    parser.add_argument("--mode", choices=["figurine", "reference"], default="figurine",
+                        help="--mode reference|figurine : flag réservé, comportement différencié dans un ticket à venir (cf. WPF-05)")
     parser.add_argument("--colors", type=int, default=5, help="Nombre de couleurs à extraire")
     parser.add_argument("--top", type=int, default=3, help="Nombre de suggestions par couleur")
     parser.add_argument("--brand", help="Filtrer par marque (ex: 'Citadel Colour')")
