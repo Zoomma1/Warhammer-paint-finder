@@ -14,6 +14,10 @@ from sklearn.cluster import KMeans
 DATASET = Path("data/paints.json")
 DEFAULT_FALLBACK_THRESHOLD = 15.0
 
+# Recipe (WPF-04): seuils de luminosité LAB (L*) relatifs au basecoat.
+SHADOW_L_DELTA = 15
+HIGHLIGHT_L_DELTA = 10
+
 SAT_THRESHOLD = 0.2
 LUMINOSITY_MAX = 0.85
 COLORED_MIN_RATIO = 10
@@ -173,6 +177,78 @@ def match_colors(
         results.append({"input_rgb": color.tolist(), "matches": matches})
     return results
 
+def _nearest(target_lab: np.ndarray, paints_lab: np.ndarray, mask: np.ndarray | None = None) -> tuple[int, float] | None:
+    """Index + ΔE de la peinture la plus proche en LAB, optionnellement restreint à un masque booléen.
+    Retourne None si le masque ne sélectionne aucune peinture."""
+    indices = np.where(mask)[0] if mask is not None else np.arange(len(paints_lab))
+    if len(indices) == 0:
+        return None
+    deltas = np.sqrt(np.sum((paints_lab[indices] - target_lab) ** 2, axis=1))
+    best = int(np.argmin(deltas))
+    return int(indices[best]), float(deltas[best])
+
+def _recipe_step(paint: dict, delta_e: float, lab: np.ndarray) -> dict:
+    """Construit une étape de recette à partir d'une peinture. Type du set affiché brut."""
+    return {
+        "name": paint["name"],
+        "brand": paint["brand"],
+        "set": paint.get("set", ""),
+        "hex": paint["hex"],
+        "delta_e": round(delta_e, 2),
+        "L": round(float(lab[0]), 2),
+    }
+
+def _role_step(target_lab: np.ndarray, paints: list[dict], paints_lab: np.ndarray,
+               mask: np.ndarray, basecoat: dict) -> dict:
+    """Étape shade/highlight : la plus proche dans le masque, sinon fallback = basecoat."""
+    found = _nearest(target_lab, paints_lab, mask=mask)
+    if found is None:
+        step = dict(basecoat)
+        step["fallback"] = True
+        return step
+    idx, delta_e = found
+    step = _recipe_step(paints[idx], delta_e, paints_lab[idx])
+    step["fallback"] = False
+    return step
+
+def build_recipe(
+    color_lab: np.ndarray,
+    paints: list[dict],
+    paints_lab: np.ndarray,
+    collection: tuple[list[dict], np.ndarray] | None = None,
+) -> dict:
+    """Recette 3 étapes (basecoat → shade → highlight) pour une couleur cible LAB.
+
+    Le rôle de chaque peinture découle de sa luminosité L* relative au basecoat,
+    pas de son type Citadel. Fonction pure, séparable du CLI (prépare WPF-06).
+
+    - basecoat  : peinture au ΔE min (toutes peintures)
+    - shade     : ΔE min parmi L* < L*(basecoat) - SHADOW_L_DELTA, sinon fallback=basecoat
+    - highlight : ΔE min parmi L* > L*(basecoat) + HIGHLIGHT_L_DELTA, sinon fallback=basecoat
+
+    Si une collection est fournie, elle devient l'espace de recherche prioritaire (WPF-03).
+    """
+    color_lab = np.asarray(color_lab, dtype=float)
+    if collection is not None:
+        paints, paints_lab = collection
+    paints_lab = np.asarray(paints_lab, dtype=float)
+
+    base_idx, base_de = _nearest(color_lab, paints_lab)
+    basecoat = _recipe_step(paints[base_idx], base_de, paints_lab[base_idx])
+    base_L = basecoat["L"]
+
+    L = paints_lab[:, 0]
+    shade = _role_step(color_lab, paints, paints_lab, L < base_L - SHADOW_L_DELTA, basecoat)
+    highlight = _role_step(color_lab, paints, paints_lab, L > base_L + HIGHLIGHT_L_DELTA, basecoat)
+
+    return {"basecoat": basecoat, "shade": shade, "highlight": highlight}
+
+def _format_recipe_line(label: str, step: dict) -> str:
+    """Ligne CLI alignée pour une étape de recette. Type du set affiché brut."""
+    set_label = f"{step['brand']} — {step['set']}" if step.get("set") else step["brand"]
+    tag = "  [→ basecoat : rien dans les seuils]" if step.get("fallback") else ""
+    return f"  {label:<9}: {step['name']:<24} ({set_label})  ΔE {step['delta_e']:5.1f}{tag}"
+
 def main():
     parser = argparse.ArgumentParser(description="Warhammer Paint Finder")
     parser.add_argument("image", help="Chemin vers l'image")
@@ -182,6 +258,8 @@ def main():
     parser.add_argument("--top", type=int, default=3, help="Nombre de suggestions par couleur")
     parser.add_argument("--brand", help="Filtrer par marque (ex: 'Citadel Colour')")
     parser.add_argument("--debug", action="store_true", help="Sauvegarder l'image de debug")
+    parser.add_argument("--recipe", action="store_true",
+                        help="Afficher une recette 3 étapes (basecoat/shade/highlight) par couleur au lieu de la liste plate")
     parser.add_argument("--collection", type=Path, help="Fichier JSON de peintures possédées (priorité au matching)")
     parser.add_argument("--fallback-threshold", type=float, default=DEFAULT_FALLBACK_THRESHOLD,
                         help=f"Seuil ΔE au-delà duquel le catalogue complet est consulté (défaut: {DEFAULT_FALLBACK_THRESHOLD})")
@@ -208,12 +286,24 @@ def main():
     print(f"Extraction des couleurs ({args.colors} clusters)...")
     dominant, kmeans, img, masked_img = extract_colors(args.image, args.colors)
 
+    if args.debug:
+        save_debug(img, kmeans, dominant, masked_img=masked_img)
+
+    if args.recipe:
+        print("Recettes...\n")
+        for i, color in enumerate(dominant):
+            color_lab = rgb_to_lab(color.astype(float))
+            recipe = build_recipe(color_lab, paints, paints_lab, collection=collection)
+            rgb = color.tolist()
+            print(f"Couleur {i+1} — RGB({rgb[0]}, {rgb[1]}, {rgb[2]})")
+            for label, role in (("Basecoat", "basecoat"), ("Shade", "shade"), ("Highlight", "highlight")):
+                print(_format_recipe_line(label, recipe[role]))
+            print()
+        return
+
     print("Matching...\n")
     results = match_colors(dominant, paints, paints_lab, args.top, args.brand,
                            collection=collection, fallback_threshold=args.fallback_threshold)
-
-    if args.debug:
-        save_debug(img, kmeans, dominant, masked_img=masked_img)
 
     for i, r in enumerate(results):
         rgb = r["input_rgb"]
