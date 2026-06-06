@@ -1,0 +1,5 @@
+[tool.pytest.ini_options]
+# La racine du repo doit être importable pour `from colour_matcher import ...`,
+# y compris avec un simple `pytest tests/` (pas seulement `python -m pytest`).
+pythonpath = ["."]
+testpaths = ["tests"]
