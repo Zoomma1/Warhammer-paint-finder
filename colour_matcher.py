@@ -24,6 +24,11 @@ COLORED_MIN_RATIO = 10
 KMEANS_N_INIT = 10
 KMEANS_RANDOM_STATE = 42
 
+# Nombre de clusters par défaut selon le mode (WPF-05).
+# reference (artwork) : palette plus large, toutes les couleurs sont intentionnelles.
+DEFAULT_COLORS_FIGURINE = 5
+DEFAULT_COLORS_REFERENCE = 8
+
 def rgb_to_lab(rgb: np.ndarray) -> np.ndarray:
     """Convert RGB array (0-255) to CIE LAB. Accepts any shape (..., 3)."""
     rgb = np.array(rgb, dtype=float) / 255.0
@@ -67,10 +72,28 @@ def remove_background(img: Image.Image) -> Image.Image:
         print(f"⚠️  rembg indisponible ({e}) — analyse sur l'image complète")
         return img
 
+def select_source_pixels(
+    pixels: np.ndarray,
+    n_colors: int,
+    mode: str = "figurine",
+    sat_threshold: float = SAT_THRESHOLD,
+) -> np.ndarray:
+    """Pixels envoyés au K-means selon le mode (WPF-05).
+
+    'reference' (artwork) : toutes les couleurs sont intentionnelles → aucun filtre.
+    'figurine' : filtrage saturation/luminosité, avec fallback sur tous les pixels
+    si trop peu passent le filtre (image très désaturée)."""
+    if mode == "reference":
+        return pixels
+    saturation, cmax = compute_saturation_mask(pixels)
+    colored = pixels[(saturation > sat_threshold) & (cmax/255 < LUMINOSITY_MAX)]
+    return colored if len(colored) > n_colors * COLORED_MIN_RATIO else pixels
+
 def extract_colors(
     image_path: str | Path,
     n_colors: int = 5,
     sat_threshold: float = SAT_THRESHOLD,
+    mode: str = "figurine",
 ) -> tuple[np.ndarray, KMeans, Image.Image, Image.Image]:
     """Cluster dominant colours in image_path; returns (centers, kmeans, img, masked_img)."""
     img = Image.open(image_path).convert("RGB")
@@ -83,9 +106,7 @@ def extract_colors(
     else:
         pixels = np.array(masked_img).reshape(-1, 3).astype(float)
 
-    saturation, cmax = compute_saturation_mask(pixels)
-    colored = pixels[(saturation > sat_threshold) & (cmax/255 < LUMINOSITY_MAX)]
-    source = colored if len(colored) > n_colors * COLORED_MIN_RATIO else pixels
+    source = select_source_pixels(pixels, n_colors, mode=mode, sat_threshold=sat_threshold)
 
     kmeans = KMeans(n_clusters=n_colors, n_init=KMEANS_N_INIT, random_state=KMEANS_RANDOM_STATE)
     kmeans.fit(source)
@@ -249,12 +270,21 @@ def _format_recipe_line(label: str, step: dict) -> str:
     tag = "  [→ basecoat : rien dans les seuils]" if step.get("fallback") else ""
     return f"  {label:<9}: {step['name']:<24} ({set_label})  ΔE {step['delta_e']:5.1f}{tag}"
 
+def resolve_n_colors(mode: str, requested: int | None) -> int:
+    """Nombre de clusters (WPF-05) : valeur explicite si fournie, sinon défaut
+    conditionnel au mode (reference → 8, figurine → 5)."""
+    if requested is not None:
+        return requested
+    return DEFAULT_COLORS_REFERENCE if mode == "reference" else DEFAULT_COLORS_FIGURINE
+
 def main():
     parser = argparse.ArgumentParser(description="Warhammer Paint Finder")
     parser.add_argument("image", help="Chemin vers l'image")
     parser.add_argument("--mode", choices=["figurine", "reference"], default="figurine",
-                        help="--mode reference|figurine : flag réservé, comportement différencié dans un ticket à venir (cf. WPF-05)")
-    parser.add_argument("--colors", type=int, default=5, help="Nombre de couleurs à extraire")
+                        help="figurine : photo de figurine (filtrage fond/saturation). "
+                             "reference : artwork/concept art (toutes les couleurs intentionnelles, défaut 8 clusters)")
+    parser.add_argument("--colors", type=int, default=None,
+                        help="Nombre de couleurs à extraire (défaut : 8 en reference, 5 en figurine)")
     parser.add_argument("--top", type=int, default=3, help="Nombre de suggestions par couleur")
     parser.add_argument("--brand", help="Filtrer par marque (ex: 'Citadel Colour')")
     parser.add_argument("--debug", action="store_true", help="Sauvegarder l'image de debug")
@@ -283,8 +313,9 @@ def main():
             msg += f" — {skipped} ignorées (pas de valeur RGB)"
         print(msg)
 
-    print(f"Extraction des couleurs ({args.colors} clusters)...")
-    dominant, kmeans, img, masked_img = extract_colors(args.image, args.colors)
+    n_colors = resolve_n_colors(args.mode, args.colors)
+    print(f"Extraction des couleurs ({n_colors} clusters, mode {args.mode})...")
+    dominant, kmeans, img, masked_img = extract_colors(args.image, n_colors, mode=args.mode)
 
     if args.debug:
         save_debug(img, kmeans, dominant, masked_img=masked_img)
