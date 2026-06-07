@@ -3,5 +3,5 @@ scikit-learn
 numpy
 requests
 jupyter
-rembg
+rembg[cpu]
 pytest
