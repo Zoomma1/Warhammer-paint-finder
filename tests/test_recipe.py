@@ -9,7 +9,7 @@
 import numpy as np
 import pytest
 
-from colour_matcher import build_recipe
+from wpf.core import build_recipe
 
 # Couleur cible : un vert. L* = 50.
 TARGET_LAB = np.array([50.0, -40.0, 30.0])

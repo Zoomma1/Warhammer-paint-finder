@@ -15,7 +15,7 @@
 import numpy as np
 from PIL import Image
 
-from colour_matcher import (
+from wpf.core import (
     DEFAULT_COLORS_FIGURINE,
     DEFAULT_COLORS_REFERENCE,
     extract_colors,
@@ -102,7 +102,7 @@ def _save_red_white_image(tmp_path):
 
 def test_extract_colors_mode_wired(tmp_path, monkeypatch):
     # remove_background neutralisé : pas de rembg, image RGB inchangée.
-    monkeypatch.setattr("colour_matcher.remove_background", lambda img: img)
+    monkeypatch.setattr("wpf.core.remove_background", lambda img: img)
     path = _save_red_white_image(tmp_path)
 
     ref_centers, *_ = extract_colors(path, n_colors=2, mode="reference")

@@ -13,7 +13,7 @@ import json
 import numpy as np
 import pytest
 
-from colour_matcher import (
+from wpf.core import (
     compute_saturation_mask,
     load_paints,
     match_colors,
