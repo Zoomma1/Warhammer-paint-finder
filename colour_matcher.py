@@ -4,6 +4,7 @@
 # Usage:
 #   python colour_matcher.py --mode figurine <image.jpg>
 #   python colour_matcher.py --mode reference <image.jpg>
+#   python colour_matcher.py --zones <image.jpg>
 
 import json
 import argparse
@@ -14,12 +15,14 @@ from sklearn.cluster import KMeans
 
 from wpf.core import (
     DEFAULT_FALLBACK_THRESHOLD,
+    DEFAULT_ZONES,
     build_recipe,
     extract_colors,
     load_paints,
     match_colors,
     resolve_n_colors,
     rgb_to_lab,
+    segment_zones,
 )
 
 DATASET = Path("data/paints.json")
@@ -62,6 +65,10 @@ def main():
     parser.add_argument("--top", type=int, default=3, help="Nombre de suggestions par couleur")
     parser.add_argument("--brand", help="Filtrer par marque (ex: 'Citadel Colour')")
     parser.add_argument("--debug", action="store_true", help="Sauvegarder l'image de debug")
+    parser.add_argument("--zones", action="store_true",
+                        help="Découper la figurine en zones spatiales (affichage brut, WPF-07a)")
+    parser.add_argument("--n-zones", type=int, default=DEFAULT_ZONES,
+                        help=f"Nombre de zones pour --zones (défaut {DEFAULT_ZONES})")
     parser.add_argument("--recipe", action="store_true",
                         help="Afficher une recette 3 étapes (basecoat/shade/highlight) par couleur au lieu de la liste plate")
     parser.add_argument("--collection", type=Path, help="Fichier JSON de peintures possédées (priorité au matching)")
@@ -93,6 +100,16 @@ def main():
 
     if args.debug:
         save_debug(img, kmeans, dominant, masked_img=masked_img)
+
+    if args.zones:
+        zones = segment_zones(masked_img, n_zones=args.n_zones)
+        print(f"Zones détectées : {len(zones)}")
+        for z in zones:
+            r, g, b = z["rgb"]
+            n = len(z["regions"])
+            print(f"  #{z['zone_id']:<2d} RGB({r:3d}, {g:3d}, {b:3d})   {z['area_ratio']*100:4.1f} %   "
+                  f"{n} îlot{'s' if n > 1 else ''}   bbox {z['bbox']}")
+        return
 
     if args.recipe:
         print("Recettes...\n")
