@@ -7,6 +7,7 @@ import json
 import numpy as np
 from pathlib import Path
 from PIL import Image
+from scipy import ndimage
 from sklearn.cluster import KMeans
 
 DEFAULT_FALLBACK_THRESHOLD = 15.0
@@ -14,6 +15,22 @@ DEFAULT_FALLBACK_THRESHOLD = 15.0
 # Recipe (WPF-04): seuils de luminosité LAB (L*) relatifs au basecoat.
 SHADOW_L_DELTA = 15
 HIGHLIGHT_L_DELTA = 10
+
+# Zones (WPF-07a) : aire minimale d'une zone et de ses îlots, en ratio de la surface
+# non transparente (indépendant de la résolution). En dessous → bruit, écarté.
+ZONE_MIN_AREA_RATIO = 0.01
+# Rayon du vote majoritaire appliqué à la carte des labels avant le découpage,
+# en ratio du plus petit côté. Sans lui, les ombrages font alterner les pixels
+# voisins entre deux clusters → des milliers de miettes sous le seuil d'aire.
+ZONE_SMOOTH_RATIO = 0.015
+# Clustering des zones sur [L, a, b, λ·x, λ·y] : positions ramenées à l'échelle
+# de L* (grand côté = 100) puis pondérées par ZONE_SPATIAL_WEIGHT — 1.0 signifie
+# qu'une traversée de l'image « coûte » autant qu'un ΔE de 100. Le fit se fait
+# sur un échantillon (ZONE_FIT_SAMPLE pixels) puis predict sur toute la grille.
+DEFAULT_ZONES = 12
+ZONE_SPATIAL_WEIGHT = 0.5
+ZONE_FIT_SAMPLE = 50_000
+ALPHA_MIN = 10
 
 SAT_THRESHOLD = 0.2
 LUMINOSITY_MAX = 0.85
@@ -98,7 +115,7 @@ def extract_colors(
 
     if masked_img.mode == "RGBA":
         rgba = np.array(masked_img)
-        alpha_flat = rgba[:, :, 3].reshape(-1) > 10
+        alpha_flat = rgba[:, :, 3].reshape(-1) > ALPHA_MIN
         pixels = rgba[:, :, :3].reshape(-1, 3).astype(float)[alpha_flat]
     else:
         pixels = np.array(masked_img).reshape(-1, 3).astype(float)
@@ -108,6 +125,104 @@ def extract_colors(
     kmeans = KMeans(n_clusters=n_colors, n_init=KMEANS_N_INIT, random_state=KMEANS_RANDOM_STATE)
     kmeans.fit(source)
     return kmeans.cluster_centers_.astype(int), kmeans, img, masked_img
+
+def _smooth_labels(labels: np.ndarray, n_clusters: int, size: int) -> np.ndarray:
+    """Vote majoritaire : chaque pixel valide prend le label le plus fréquent
+    dans sa fenêtre size×size. Les pixels -1 (hors zone) ne votent pas et le
+    restent. size < 3 → aucun lissage."""
+    if size < 3:
+        return labels
+    votes = np.stack([ndimage.uniform_filter((labels == c).astype(float), size=size, mode="constant")
+                      for c in range(n_clusters)])
+    smoothed = votes.argmax(axis=0)
+    return np.where(labels >= 0, smoothed, -1)
+
+def segment_zones(
+    masked_img: Image.Image,
+    n_zones: int = DEFAULT_ZONES,
+    spatial_weight: float = ZONE_SPATIAL_WEIGHT,
+    min_area_ratio: float = ZONE_MIN_AREA_RATIO,
+    smooth_ratio: float = ZONE_SMOOTH_RATIO,
+) -> list[dict]:
+    """Découpe masked_img en zones spatiales (WPF-07a) : K-means sur couleur LAB
+    + position, sur tous les pixels opaques. Une zone = un cluster + ses îlots
+    (régions connexes). Zones triées par aire décroissante.
+
+    Indépendant du K-means de extract_colors (palette) : deux surfaces de même
+    peinture mais éclairées différemment sont deux zones — c'est voulu, elles
+    n'auront pas la même recette. Deux matières de même couleur mais éloignées
+    (cornes vs chair) sont séparées par la position, ce que la couleur seule ne
+    fait pas. rgb/lab d'une zone = moyenne réelle de ses pixels.
+    La carte des labels est lissée par vote majoritaire (smooth_ratio).
+    area_ratio est relatif à la surface non transparente ; min_area_ratio
+    écarte les zones trop petites et, dans chaque zone, les îlots de bruit
+    (le plus grand îlot est toujours conservé). bbox = union des îlots gardés."""
+    arr = np.array(masked_img)
+    if masked_img.mode == "RGBA":
+        opaque = arr[:, :, 3] > ALPHA_MIN
+        rgb = arr[:, :, :3].astype(float)
+    else:
+        rgb = arr.astype(float)
+        opaque = np.ones(rgb.shape[:2], dtype=bool)
+    height, width = arr.shape[:2]
+    n_opaque = int(opaque.sum())
+    if n_opaque == 0:
+        return []
+
+    ys, xs = np.nonzero(opaque)
+    scale = 100.0 / max(height, width) * spatial_weight
+    features = np.column_stack([rgb_to_lab(rgb[opaque]), xs * scale, ys * scale])
+
+    rng = np.random.default_rng(KMEANS_RANDOM_STATE)
+    sample = rng.choice(n_opaque, size=min(n_opaque, ZONE_FIT_SAMPLE), replace=False)
+    # Borné à [1, taille de l'échantillon] : KMeans refuse n_clusters <= 0 ou > n_samples.
+    n_zones = max(1, min(n_zones, len(sample)))
+    kmeans = KMeans(n_clusters=n_zones, n_init=KMEANS_N_INIT, random_state=KMEANS_RANDOM_STATE)
+    kmeans.fit(features[sample])
+
+    labels = np.full((height, width), -1, dtype=int)
+    labels[opaque] = kmeans.predict(features)
+    labels = _smooth_labels(labels, n_zones, int(round(smooth_ratio * min(height, width))))
+
+    zones = []
+    for cluster_id in range(n_zones):
+        mask = labels == cluster_id
+        area_px = int(mask.sum())
+        if area_px == 0 or area_px / n_opaque < min_area_ratio:
+            continue
+        mean_rgb = rgb[mask].mean(axis=0)
+        regions = _regions(mask, n_opaque)
+        kept = [r for r in regions if r["area_ratio"] >= min_area_ratio] or regions[:1]
+        zones.append({
+            "cluster_id": cluster_id,
+            "rgb": mean_rgb.astype(int).tolist(),
+            "lab": rgb_to_lab(mean_rgb),
+            "area_px": area_px,
+            "area_ratio": area_px / n_opaque,
+            "bbox": (min(r["bbox"][0] for r in kept), min(r["bbox"][1] for r in kept),
+                     max(r["bbox"][2] for r in kept), max(r["bbox"][3] for r in kept)),
+            "regions": kept,
+        })
+
+    zones.sort(key=lambda z: z["area_px"], reverse=True)
+    for zone_id, zone in enumerate(zones, start=1):
+        zone["zone_id"] = zone_id
+    return zones
+
+def _regions(mask: np.ndarray, n_opaque: int) -> list[dict]:
+    """Îlots (régions connexes) d'un masque booléen, triés par aire décroissante.
+    bbox = (left, top, right, bottom)."""
+    components, _ = ndimage.label(mask)
+    regions = []
+    for region_id, (rows, cols) in enumerate(ndimage.find_objects(components), start=1):
+        area_px = int((components[rows, cols] == region_id).sum())
+        regions.append({
+            "area_px": area_px,
+            "area_ratio": area_px / n_opaque,
+            "bbox": (cols.start, rows.start, cols.stop, rows.stop),
+        })
+    regions.sort(key=lambda r: r["area_px"], reverse=True)
+    return regions
 
 def match_colors(
     dominant_colors: np.ndarray,
